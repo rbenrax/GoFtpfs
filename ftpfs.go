@@ -1,19 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
-	"net/textproto"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,10 +43,10 @@ type Cache struct {
 
 // Archivo representa un archivo en el sistema FTP
 type Archivo struct {
-	fs     *FTPFS
-	path   string
-	mu     sync.RWMutex
-	buffer []byte
+	fs      *FTPFS
+	path    string
+	mu      sync.RWMutex
+	buffer  []byte
 	isDirty bool
 }
 
@@ -166,7 +163,7 @@ func (d *Directorio) Attr(ctx context.Context, a *fuse.Attr) error {
 // Lookup busca un archivo o directorio
 func (d *Directorio) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	fullPath := path.Join(d.path, name)
-	
+
 	conn, err := d.fs.ObtenerConexion()
 	if err != nil {
 		return nil, fuse.ENOENT
@@ -179,8 +176,8 @@ func (d *Directorio) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	}
 
 	// Intentar obtener como archivo
-	_, err = conn.FileSize(fullPath)
-	if err != nil {
+	size, err := conn.FileSize(fullPath)
+	if err != nil || size < 0 {
 		return nil, fuse.ENOENT
 	}
 
@@ -206,13 +203,13 @@ func (d *Directorio) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	key := "dir:" + d.path
 	entries, err, _ := d.fs.group.Do(key, func() (interface{}, error) {
 		var dirents []fuse.Dirent
-		
+
 		// Listar directorio
 		listPath := d.path
 		if listPath == "/" {
 			listPath = "."
 		}
-		
+
 		ftpEntries, err := conn.List(listPath)
 		if err != nil {
 			return nil, err
@@ -257,7 +254,7 @@ func (d *Directorio) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 // Create crea un nuevo archivo
 func (d *Directorio) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	fullPath := path.Join(d.path, req.Name)
-	
+
 	conn, err := d.fs.ObtenerConexion()
 	if err != nil {
 		return nil, nil, fuse.EIO
@@ -282,7 +279,7 @@ func (d *Directorio) Create(ctx context.Context, req *fuse.CreateRequest, resp *
 // Mkdir crea un nuevo directorio
 func (d *Directorio) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	fullPath := path.Join(d.path, req.Name)
-	
+
 	conn, err := d.fs.ObtenerConexion()
 	if err != nil {
 		return nil, fuse.EIO
@@ -304,13 +301,12 @@ func (d *Directorio) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node
 // Remove elimina un archivo o directorio
 func (d *Directorio) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	fullPath := path.Join(d.path, req.Name)
-	
+
 	conn, err := d.fs.ObtenerConexion()
 	if err != nil {
 		return fuse.EIO
 	}
 
-	var err error
 	if req.Dir {
 		err = conn.RemoveDir(fullPath)
 	} else {
@@ -335,7 +331,7 @@ func (d *Directorio) Rename(ctx context.Context, req *fuse.RenameRequest, newDir
 	oldPath := path.Join(d.path, req.OldName)
 	newParent := newDir.(*Directorio)
 	newPath := path.Join(newParent.path, req.NewName)
-	
+
 	conn, err := d.fs.ObtenerConexion()
 	if err != nil {
 		return fuse.EIO
@@ -375,7 +371,7 @@ func (a *Archivo) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Uid = uint32(os.Getuid())
 	attr.Gid = uint32(os.Getgid())
 	attr.Valid = 10 * time.Second
-	
+
 	return nil
 }
 
@@ -430,7 +426,7 @@ func (a *Archivo) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Re
 
 	resp.Data = make([]byte, end-req.Offset)
 	copy(resp.Data, data[req.Offset:end])
-	
+
 	return nil
 }
 
@@ -509,7 +505,7 @@ func (a *Archivo) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	return a.Flush(ctx, &fuse.FlushRequest{})
 }
 
-// ========== FUNCIÓN PRINCIPAL ==========
+// ========== FUNCIÓN PRINCIPAL CON FUSE2 ==========
 
 func main() {
 	// Configuración por defecto
@@ -558,10 +554,6 @@ func main() {
 			if i < len(os.Args) {
 				config.Password = os.Args[i]
 			}
-		case "-d", "--debug":
-			// El debug se maneja con FUSE
-		case "-f", "--foreground":
-			// Por defecto ya está en foreground
 		}
 	}
 
@@ -581,13 +573,11 @@ func main() {
 	}
 	defer ftpFS.conn.Quit()
 
-	// Configurar FUSE
+	// Configurar FUSE - SIN opciones que requieran FUSE3
 	fuseConfig := []fuse.MountOption{
 		fuse.FSName("ftpfs"),
 		fuse.Subtype("ftpfs"),
-		fuse.LocalVolume(),
-		fuse.VolumeName("FTP:" + config.Host),
-		fuse.AllowOther(),
+		// Remove AllowOther para compatibilidad con FUSE2
 	}
 
 	// Montar sistema de archivos
@@ -600,7 +590,7 @@ func main() {
 	// Manejar señales para desmontar correctamente
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	
+
 	go func() {
 		<-sigCh
 		fmt.Println("\nDesmontando...")
@@ -609,14 +599,12 @@ func main() {
 	}()
 
 	// Servir sistema de archivos
+	fmt.Println("Sistema de archivos montado correctamente. Presiona Ctrl+C para desmontar.")
+
 	err = fs.Serve(c, ftpFS)
 	if err != nil {
 		log.Fatalf("Error sirviendo FUSE: %v", err)
 	}
 
-	// Verificar si el mount fue exitoso
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		log.Fatalf("Error de montaje: %v", err)
-	}
+	fmt.Println("Sistema de archivos desmontado.")
 }
