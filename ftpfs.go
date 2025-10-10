@@ -31,6 +31,7 @@ type FTPFS struct {
 	mu       sync.RWMutex
 	cache    *Cache
 	group    singleflight.Group
+	tempDir  string
 }
 
 // Cache para directorios y archivos
@@ -41,13 +42,14 @@ type Cache struct {
 	ttl        time.Duration
 }
 
-// Archivo representa un archivo en el sistema FTP
+// Archivo representa un archivo en el sistema FTP con cache temporal
 type Archivo struct {
-	fs      *FTPFS
-	path    string
-	mu      sync.RWMutex
-	buffer  []byte
-	isDirty bool
+	fs       *FTPFS
+	path     string
+	mu       sync.RWMutex
+	tempFile string
+	isDirty  bool
+	isOpen   bool
 }
 
 // Directorio representa un directorio en el sistema FTP
@@ -79,18 +81,38 @@ func NuevoFTPFS(cfg Config) (*FTPFS, error) {
 		return nil, fmt.Errorf("error de login: %w", err)
 	}
 
+	// Crear directorio temporal
+	tempDir, err := os.MkdirTemp("", "ftpfs_*")
+	if err != nil {
+		return nil, fmt.Errorf("error creando directorio temporal: %w", err)
+	}
+
+	log.Printf("Directorio temporal creado: %s", tempDir)
+
 	return &FTPFS{
 		host:     cfg.Host,
 		port:     cfg.Port,
 		user:     cfg.User,
 		password: cfg.Password,
 		conn:     conn,
+		tempDir:  tempDir,
 		cache: &Cache{
 			dirEntries: make(map[string][]fuse.Dirent),
 			fileData:   make(map[string][]byte),
 			ttl:        cfg.CacheTTL,
 		},
 	}, nil
+}
+
+// Cleanup limpia recursos temporales
+func (f *FTPFS) Cleanup() {
+	if f.tempDir != "" {
+		os.RemoveAll(f.tempDir)
+		log.Printf("Directorio temporal eliminado: %s", f.tempDir)
+	}
+	if f.conn != nil {
+		f.conn.Quit()
+	}
 }
 
 // Reconectar reconecta al servidor FTP si es necesario
@@ -352,10 +374,66 @@ func (d *Directorio) Rename(ctx context.Context, req *fuse.RenameRequest, newDir
 	return nil
 }
 
-// ========== IMPLEMENTACIÓN DE ARCHIVO ==========
+// ========== IMPLEMENTACIÓN DE ARCHIVO CON CACHE TEMPORAL ==========
+
+// Open implementa fs.NodeOpener
+func (a *Archivo) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Si se abre para escritura, crear archivo temporal
+	if req.Flags&fuse.OpenWriteOnly != 0 || req.Flags&fuse.OpenReadWrite != 0 {
+		// Crear archivo temporal
+		tempFile, err := os.CreateTemp(a.fs.tempDir, fmt.Sprintf("temp_*_%s", filepath.Base(a.path)))
+		if err != nil {
+			return nil, fuse.EIO
+		}
+		a.tempFile = tempFile.Name()
+		tempFile.Close()
+
+		// Descargar archivo existente si existe
+		conn, err := a.fs.ObtenerConexion()
+		if err != nil {
+			return nil, fuse.EIO
+		}
+
+		r, err := conn.Retr(a.path)
+		if err == nil {
+			// Archivo existe, copiarlo al temporal
+			f, err := os.OpenFile(a.tempFile, os.O_WRONLY, 0644)
+			if err != nil {
+				return nil, fuse.EIO
+			}
+			io.Copy(f, r)
+			f.Close()
+			r.Close()
+		}
+		// Si no existe, el archivo temporal queda vacío
+
+		a.isOpen = true
+		resp.Flags |= fuse.OpenDirectIO
+	}
+
+	return a, nil
+}
 
 // Attr retorna los atributos del archivo
 func (a *Archivo) Attr(ctx context.Context, attr *fuse.Attr) error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	// Si hay archivo temporal abierto, usar su tamaño
+	if a.isOpen && a.tempFile != "" {
+		if info, err := os.Stat(a.tempFile); err == nil {
+			attr.Mode = 0644
+			attr.Size = uint64(info.Size())
+			attr.Uid = uint32(os.Getuid())
+			attr.Gid = uint32(os.Getgid())
+			attr.Valid = 10 * time.Second
+			return nil
+		}
+	}
+
 	conn, err := a.fs.ObtenerConexion()
 	if err != nil {
 		return fuse.EIO
@@ -380,18 +458,20 @@ func (a *Archivo) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Re
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	// Si hay datos en buffer, leer desde allí
-	if a.isDirty && len(a.buffer) > 0 {
-		end := req.Offset + int64(req.Size)
-		if end > int64(len(a.buffer)) {
-			end = int64(len(a.buffer))
+	// Si hay archivo temporal, leer desde allí
+	if a.isOpen && a.tempFile != "" {
+		f, err := os.Open(a.tempFile)
+		if err != nil {
+			return fuse.EIO
 		}
-		if req.Offset >= int64(len(a.buffer)) {
-			resp.Data = []byte{}
-			return nil
+		defer f.Close()
+
+		buf := make([]byte, req.Size)
+		n, err := f.ReadAt(buf, req.Offset)
+		if err != nil && err != io.EOF {
+			return fuse.EIO
 		}
-		resp.Data = make([]byte, end-req.Offset)
-		copy(resp.Data, a.buffer[req.Offset:end])
+		resp.Data = buf[:n]
 		return nil
 	}
 
@@ -430,55 +510,125 @@ func (a *Archivo) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Re
 	return nil
 }
 
-// Write escribe datos en el archivo
+// Write escribe datos en el archivo temporal
 func (a *Archivo) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Asegurar que el buffer es suficientemente grande
-	requiredSize := int(req.Offset) + len(req.Data)
-	if requiredSize > len(a.buffer) {
-		newBuffer := make([]byte, requiredSize)
-		copy(newBuffer, a.buffer)
-		a.buffer = newBuffer
+	// Si no hay archivo temporal, crearlo
+	if a.tempFile == "" {
+		tempFile, err := os.CreateTemp(a.fs.tempDir, fmt.Sprintf("temp_direct_*_%s", filepath.Base(a.path)))
+		if err != nil {
+			return fuse.EIO
+		}
+		a.tempFile = tempFile.Name()
+		tempFile.Close()
+
+		// Intentar descargar archivo existente
+		conn, err := a.fs.ObtenerConexion()
+		if err == nil {
+			r, err := conn.Retr(a.path)
+			if err == nil {
+				f, _ := os.OpenFile(a.tempFile, os.O_WRONLY, 0644)
+				if f != nil {
+					io.Copy(f, r)
+					f.Close()
+				}
+				r.Close()
+			}
+		}
+		a.isOpen = true
 	}
 
-	// Escribir datos en buffer
-	copy(a.buffer[req.Offset:], req.Data)
-	a.isDirty = true
+	// Escribir en archivo temporal
+	f, err := os.OpenFile(a.tempFile, os.O_WRONLY, 0644)
+	if err != nil {
+		return fuse.EIO
+	}
+	defer f.Close()
 
-	resp.Size = len(req.Data)
+	n, err := f.WriteAt(req.Data, req.Offset)
+	if err != nil {
+		return fuse.EIO
+	}
+
+	a.isDirty = true
+	resp.Size = n
 	return nil
 }
 
-// Flush sincroniza los datos - IMPORTANTE para VS Code
+// Flush sincroniza los datos - NO sube aún
 func (a *Archivo) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	// En Python, flush no hace nada inmediatamente
+	// La sincronización real ocurre en release/fsync
+	return nil
+}
+
+// Fsync sincronización forzada - sube a FTP
+func (a *Archivo) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	return a.uploadTempFile()
+}
+
+// Release llamado cuando se cierra el archivo - SUBIR a FTP
+func (a *Archivo) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if !a.isDirty {
+	// Subir archivo si es necesario
+	if a.isDirty && a.tempFile != "" {
+		if err := a.uploadTempFile(); err != nil {
+			log.Printf("Error subiendo archivo en release: %v", err)
+		}
+	}
+
+	// Limpiar archivo temporal
+	if a.tempFile != "" {
+		os.Remove(a.tempFile)
+		a.tempFile = ""
+	}
+
+	a.isOpen = false
+	a.isDirty = false
+
+	return nil
+}
+
+// uploadTempFile sube el archivo temporal al servidor FTP
+func (a *Archivo) uploadTempFile() error {
+	if a.tempFile == "" {
 		return nil
 	}
 
-	// Subir datos a FTP
+	if _, err := os.Stat(a.tempFile); os.IsNotExist(err) {
+		return nil
+	}
+
 	conn, err := a.fs.ObtenerConexion()
 	if err != nil {
 		return fuse.EIO
 	}
 
-	data := bytes.NewReader(a.buffer)
-	err = conn.Stor(a.path, data)
+	f, err := os.Open(a.tempFile)
 	if err != nil {
 		return fuse.EIO
 	}
+	defer f.Close()
 
-	// Invalidar cache
+	err = conn.Stor(a.path, f)
+	if err != nil {
+		log.Printf("Error subiendo %s: %v", a.path, err)
+		return fuse.EIO
+	}
+
+	// Invalidar caché del directorio
 	a.fs.cache.mu.Lock()
-	delete(a.fs.cache.fileData, a.path)
 	delete(a.fs.cache.dirEntries, filepath.Dir(a.path))
+	delete(a.fs.cache.fileData, a.path)
 	a.fs.cache.mu.Unlock()
 
+	log.Printf("Archivo subido exitosamente: %s", a.path)
 	a.isDirty = false
+
 	return nil
 }
 
@@ -488,24 +638,18 @@ func (a *Archivo) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *f
 		a.mu.Lock()
 		defer a.mu.Unlock()
 
-		if int(req.Size) < len(a.buffer) {
-			a.buffer = a.buffer[:req.Size]
-		} else {
-			newBuffer := make([]byte, req.Size)
-			copy(newBuffer, a.buffer)
-			a.buffer = newBuffer
+		// Si hay archivo temporal, truncarlo
+		if a.tempFile != "" {
+			if err := os.Truncate(a.tempFile, int64(req.Size)); err != nil {
+				return fuse.EIO
+			}
+			a.isDirty = true
 		}
-		a.isDirty = true
 	}
 	return nil
 }
 
-// Fsync sincronización forzada - CRÍTICO para VS Code
-func (a *Archivo) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	return a.Flush(ctx, &fuse.FlushRequest{})
-}
-
-// ========== FUNCIÓN PRINCIPAL CON FUSE2 ==========
+// ========== FUNCIÓN PRINCIPAL ==========
 
 func main() {
 	// Configuración por defecto
@@ -565,19 +709,20 @@ func main() {
 	fmt.Printf("Montando %s:%d en %s\n", config.Host, config.Port, mountpoint)
 	fmt.Printf("Usuario: %s\n", config.User)
 	fmt.Println("Para desmontar: fusermount -u", mountpoint)
+	fmt.Println("VS Code support version")
 
 	// Crear sistema de archivos FTP
 	ftpFS, err := NuevoFTPFS(config)
 	if err != nil {
 		log.Fatalf("Error creando FTPFS: %v", err)
 	}
-	defer ftpFS.conn.Quit()
+	defer ftpFS.Cleanup()
 
-	// Configurar FUSE - SIN opciones que requieran FUSE3
+	// Configurar FUSE
 	fuseConfig := []fuse.MountOption{
 		fuse.FSName("ftpfs"),
 		fuse.Subtype("ftpfs"),
-		// Remove AllowOther para compatibilidad con FUSE2
+		fuse.WritebackCache(), // Mejora rendimiento de escritura
 	}
 
 	// Montar sistema de archivos
