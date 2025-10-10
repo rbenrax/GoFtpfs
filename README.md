@@ -1,5 +1,5 @@
-# GoFtpfs (Not ready yet, working on)
-Go version of fuse ftpfs utlity
+# GoFtpfs 
+Go version of fuse ftpfs utlity, (Not ready yet, working on)
 
 #  Install dependencies
 go mod tidy
