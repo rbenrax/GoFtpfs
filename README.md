@@ -8,10 +8,10 @@ go mod tidy
 go build -o ftpfs ftpfs.go
 
 # Mount FTP
-./ftpfs ftp.miservidor.com /mnt/ftp -u user -P password
+./ftpfs ftp.server.com /mnt/ftp -u user -P password
 
-# Monut with específic options
-./ftpfs ftp.ejemplo.com /mnt/ftp -p 2121 -u user -P password -d
+# Mount with específic options
+./ftpfs ftp.server.com /mnt/ftp -p 21 -u user -P password -d
 
 # Umount
 fusermount -u /mnt/ftp
