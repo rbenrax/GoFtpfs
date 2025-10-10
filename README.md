@@ -1,16 +1,17 @@
-# GoFtpfs
+# GoFtpfs (Not ready yet, working on)
 Go version of fuse ftpfs utlity
-# Instalar dependencias
+
+#  Install dependencies
 go mod tidy
 
-# Compilar
+# Compile
 go build -o ftpfs ftpfs.go
 
-# Montar FTP
-./ftpfs ftp.miservidor.com /mnt/ftp -u usuario -P contraseña
+# Mount FTP
+./ftpfs ftp.miservidor.com /mnt/ftp -u user -P password
 
-# Montar con opciones específicas
-./ftpfs ftp.ejemplo.com /mnt/ftp -p 2121 -u mi_usuario -P mi_contraseña -d
+# Monut with específic options
+./ftpfs ftp.ejemplo.com /mnt/ftp -p 2121 -u user -P password -d
 
-# Desmontar
+# Umount
 fusermount -u /mnt/ftp
