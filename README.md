@@ -1,11 +1,11 @@
 # GoFtpfs
 
 **GoFtpfs** is a tool written in Go that allows you to mount FTP file systems using FUSE (FTP filesystem), providing a way to work with remote FTP servers as if they were local file systems.  
-> âš ï¸ *This project is still under development and is not ready for production use.*
+> ⚠️ *This project is still under development and is not ready for production use.*
 
 ---
 
-## ðŸ“Œ Features
+## 📌 Features
 
 - Mount a remote FTP server as a local file system.
 - Written in **Golang** and based on FUSE.
@@ -13,17 +13,17 @@
 
 ---
 
-## ðŸš€ Requirements
+## 🚀 Requirements
 
 Before building and using GoFtpfs, make sure you have:
 
-- **Go** installed (recommended version â‰¥ 1.18).
+- **Go** installed (recommended version ≥ 1.18).
 - A system with **FUSE** support (Linux/macOS with fuse installed).
 - Proper permissions and configuration for FUSE on your system.
 
 ---
 
-## ðŸ› ï¸ Installation
+## 🛠️ Installation
 
 ```bash
 git clone https://github.com/rbenrax/GoFtpfs.git
@@ -34,15 +34,15 @@ go build -o ftpfs ./cmd/goftpfs
 
 ---
 
-## ðŸš€ Usage
+## 🚀 Usage
 
-### ðŸŒ Mount an FTP server
+### 🌐 Mount an FTP server
 
 ```bash
 ./ftpfs ftp.server.com /mnt/ftp -u username -P password
 ```
 
-### ðŸ”§ Common options
+### 🔧 Common options
 
 | Option | Description |
 |-------|-------------|
@@ -59,7 +59,7 @@ Example with options:
 
 ---
 
-## ðŸ”Œ Unmount the filesystem
+## 🔌 Unmount the filesystem
 
 Once mounted, you can unmount it using:
 
@@ -69,13 +69,13 @@ fusermount -u /mnt/ftp
 
 ---
 
-## ðŸ§ª Project status
+## 🧪 Project status
 
 This project is **not finished yet**; several features and improvements are still under development. Use with caution and check the *issues* section to see what is pending or planned.
 
 ---
 
-## ðŸ“ Contributing
+## 📝 Contributing
 
 If you want to contribute:
 
@@ -86,12 +86,12 @@ If you want to contribute:
 
 ---
 
-## ðŸ“œ License
+## 📜 License
 
 This project is licensed under the **Apache-2.0 License**.
 
 ---
 
-## ðŸ“Ž Resources
+## 📎 Resources
 
-- ðŸ“¦ Source code: https://github.com/rbenrax/GoFtpfs
+- 📦 Source code: https://github.com/rbenrax/GoFtpfs
